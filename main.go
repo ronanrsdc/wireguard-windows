@@ -218,7 +218,7 @@ func main() {
 		if len(os.Args) != 3 {
 			usage()
 		}
-		err := manager.InstallTunnel(os.Args[2])
+		err := manager.InstallTunnel(os.Args[2], false)
 		if err != nil {
 			fatal(err)
 		}

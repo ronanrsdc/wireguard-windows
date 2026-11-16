@@ -24,6 +24,7 @@ type EditDialog struct {
 	nameEdit                        *walk.LineEdit
 	pubkeyEdit                      *walk.LineEdit
 	syntaxEdit                      *syntax.SyntaxEdit
+	startWithWindowsCB              *walk.CheckBox
 	blockUntunneledTrafficCB        *walk.CheckBox
 	saveButton                      *walk.PushButton
 	config                          conf.Config
@@ -118,11 +119,19 @@ func newEditDialog(owner walk.Form, tunnel *manager.Tunnel) (*EditDialog, error)
 	}
 	layout.SetRange(dlg.syntaxEdit, walk.Rectangle{0, 2, 2, 1})
 
+	if dlg.startWithWindowsCB, err = walk.NewCheckBox(dlg); err != nil {
+		return nil, err
+	}
+	layout.SetRange(dlg.startWithWindowsCB, walk.Rectangle{0, 3, 2, 1})
+	dlg.startWithWindowsCB.SetText(l18n.Sprintf("Start with &Windows"))
+	dlg.startWithWindowsCB.SetToolTipText(l18n.Sprintf("When this tunnel is active, reconnect automatically after Windows restarts. Deactivating the tunnel prevents it from starting with Windows."))
+	dlg.startWithWindowsCB.SetChecked(dlg.config.StartWithWindows)
+
 	buttonsContainer, err := walk.NewComposite(dlg)
 	if err != nil {
 		return nil, err
 	}
-	layout.SetRange(buttonsContainer, walk.Rectangle{0, 3, 2, 1})
+	layout.SetRange(buttonsContainer, walk.Rectangle{0, 4, 2, 1})
 	buttonsContainer.SetLayout(walk.NewHBoxLayout())
 	buttonsContainer.Layout().SetMargins(walk.Margins{})
 
@@ -154,7 +163,10 @@ func newEditDialog(owner walk.Form, tunnel *manager.Tunnel) (*EditDialog, error)
 
 	dlg.syntaxEdit.PrivateKeyChanged().Attach(dlg.onSyntaxEditPrivateKeyChanged)
 	dlg.syntaxEdit.BlockUntunneledTrafficStateChanged().Attach(dlg.onBlockUntunneledTrafficStateChanged)
-	dlg.syntaxEdit.SetText(dlg.config.ToWgQuick())
+	// Startup is edited through the checkbox instead of the configuration text.
+	editorConfig := dlg.config
+	editorConfig.StartWithWindows = false
+	dlg.syntaxEdit.SetText(editorConfig.ToWgQuick())
 
 	// Insert a dummy label immediately preceding syntaxEdit to have screen readers read it.
 	// Otherwise they fallback to "RichEdit Control".
@@ -340,6 +352,7 @@ func (dlg *EditDialog) onSaveButtonClicked() {
 		return
 	}
 
+	cfg.StartWithWindows = dlg.startWithWindowsCB.Checked()
 	dlg.config = *cfg
 	dlg.Accept()
 }

@@ -117,7 +117,7 @@ func UninstallManager() error {
 	return err2
 }
 
-func InstallTunnel(configPath string) error {
+func InstallTunnel(configPath string, startWithWindows bool) error {
 	m, err := serviceManager()
 	if err != nil {
 		return err
@@ -166,11 +166,14 @@ func InstallTunnel(configPath string) error {
 
 	config := mgr.Config{
 		ServiceType:  windows.SERVICE_WIN32_OWN_PROCESS,
-		StartType:    mgr.StartAutomatic,
+		StartType:    mgr.StartManual,
 		ErrorControl: mgr.ErrorNormal,
 		Dependencies: []string{"Nsi", "TcpIp"},
 		DisplayName:  "WireGuard Tunnel: " + name,
 		SidType:      windows.SERVICE_SID_TYPE_UNRESTRICTED,
+	}
+	if startWithWindows {
+		config.StartType = mgr.StartAutomatic
 	}
 	service, err = m.CreateService(serviceName, path, config, "/tunnelservice", configPath)
 	if err != nil {

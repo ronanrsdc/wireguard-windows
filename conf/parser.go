@@ -145,6 +145,8 @@ func splitList(s string) ([]string, error) {
 
 type parserState int
 
+const startWithWindowsKey = "WireGuard: StartWithWindows"
+
 const (
 	inInterfaceSection parserState = iota
 	inPeerSection
@@ -175,6 +177,19 @@ func FromWgQuick(s, name string) (*Config, error) {
 		}
 		stripped := strings.TrimSpace(code)
 		if len(stripped) == 0 {
+			// Keep Windows startup metadata in a comment so exports remain
+			// compatible with other WireGuard clients.
+			if parserState == notInASection && hasComment {
+				key, value, hasValue := strings.Cut(strings.TrimSpace(after), "=")
+				if hasValue && strings.EqualFold(strings.TrimSpace(key), startWithWindowsKey) {
+					startWithWindows, err := strconv.ParseBool(strings.TrimSpace(value))
+					if err != nil {
+						return nil, &ParseError{l18n.Sprintf("Invalid Windows startup setting"), value}
+					}
+					conf.StartWithWindows = startWithWindows
+					continue
+				}
+			}
 			if len(comment) != 0 {
 				pendingComments = append(pendingComments, comment)
 			} else {
@@ -422,7 +437,8 @@ func FromWgQuickWithUnknownEncoding(s, name string) (*Config, error) {
 
 func FromDriverConfiguration(interfaze *driver.Interface, existingConfig *Config) *Config {
 	conf := Config{
-		Name: existingConfig.Name,
+		Name:             existingConfig.Name,
+		StartWithWindows: existingConfig.StartWithWindows,
 		Interface: Interface{
 			Addresses: existingConfig.Interface.Addresses,
 			DNS:       existingConfig.Interface.DNS,

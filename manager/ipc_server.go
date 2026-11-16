@@ -116,7 +116,7 @@ func (s *ManagerService) Start(tunnelName string) error {
 	if err != nil {
 		return err
 	}
-	return InstallTunnel(path)
+	return InstallTunnel(path, c.StartWithWindows)
 }
 
 func (s *ManagerService) Stop(tunnelName string) error {

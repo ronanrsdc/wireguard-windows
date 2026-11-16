@@ -33,9 +33,10 @@ type (
 )
 
 type Config struct {
-	Name      string
-	Interface Interface
-	Peers     []Peer
+	Name             string
+	StartWithWindows bool
+	Interface        Interface
+	Peers            []Peer
 
 	TrailingComments []string
 }

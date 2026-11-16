@@ -2,6 +2,21 @@
     "language": "pt-BR",
     "messages": [
         {
+            "id": "Start with &Windows",
+            "message": "Start with &Windows",
+            "translation": "Iniciar com o &Windows"
+        },
+        {
+            "id": "When this tunnel is active, reconnect automatically after Windows restarts. Deactivating the tunnel prevents it from starting with Windows.",
+            "message": "When this tunnel is active, reconnect automatically after Windows restarts. Deactivating the tunnel prevents it from starting with Windows.",
+            "translation": "Quando esta conexão estiver ativa, reconectar automaticamente após reiniciar o Windows. Desativar a conexão impede que ela inicie com o Windows."
+        },
+        {
+            "id": "Invalid Windows startup setting",
+            "message": "Invalid Windows startup setting",
+            "translation": "Configuração de inicialização do Windows inválida"
+        },
+        {
             "id": "Error",
             "message": "Error",
             "translation": "Erro",

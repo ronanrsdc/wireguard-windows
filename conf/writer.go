@@ -18,6 +18,9 @@ import (
 
 func (conf *Config) ToWgQuick() string {
 	var output strings.Builder
+	if conf.StartWithWindows {
+		output.WriteString("# " + startWithWindowsKey + " = true\n")
+	}
 
 	writeLine := func(c Comments, line string) {
 		for _, before := range c.Before {
