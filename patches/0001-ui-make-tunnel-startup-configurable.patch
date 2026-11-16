@@ -1,0 +1,1279 @@
+From 2dd5351d2d969995826adb937a61aadb9836b9ae Mon Sep 17 00:00:00 2001
+From: Ronan Silva <ronansilva755@gmail.com>
+Date: Mon, 16 Nov 2026 14:21:59 -0300
+Subject: [PATCH] ui: make tunnel startup configurable
+To: wireguard@lists.zx2c4.com
+
+Tunnel services currently use automatic startup, so an active tunnel is
+started again after Windows reboots even if the user intended to activate
+it only for the current session.
+
+Add a Start with Windows checkbox to the create/edit dialog and save the
+preference with each tunnel. Store the preference in a comment before the
+Interface section so exported configurations remain compatible with other
+WireGuard clients. Preserve it through parsing, serialization, renaming,
+export/import, and runtime configuration queries.
+
+Create tunnel services with manual startup by default, and select automatic
+startup when a tunnel is activated from the UI with this option enabled.
+The installtunnelservice command also defaults to manual startup. Existing
+installed services retain their startup setting until they are reinstalled
+or deactivated and activated again from the UI. Deactivating a tunnel still
+removes its service and prevents startup at the next boot.
+
+This intentionally changes the default for configurations without the new
+preference from automatic to manual startup. The manager service continues
+to use automatic startup.
+
+Add preference parsing and round-trip tests, update the enterprise
+documentation, and provide English and Portuguese UI strings.
+
+Validation:
+- go test ./conf -skip '^TestStorage$' -count=1
+- go build -o .deps/wireguard-check.exe .
+- git diff --check
+
+Real Windows reboot behavior has not yet been tested.
+
+Signed-off-by: Ronan Silva <ronansilva755@gmail.com>
+---
+ conf/config.go                     |   7 +-
+ conf/parser.go                     |  18 ++-
+ conf/startup_test.go               |  93 ++++++++++++
+ conf/writer.go                     |   3 +
+ docs/enterprise.md                 |   4 +
+ locales/en/messages.gotext.json    |  17 ++-
+ locales/pt-BR/messages.gotext.json |  17 ++-
+ locales/pt-PT/messages.gotext.json |  17 ++-
+ main.go                            |   2 +-
+ manager/install.go                 |   7 +-
+ manager/ipc_server.go              |   2 +-
+ ui/editdialog.go                   |  17 ++-
+ zgotext.go                         | 227 ++++++++++++++++++-----------
+ 13 files changed, 331 insertions(+), 100 deletions(-)
+ create mode 100644 conf/startup_test.go
+
+diff --git a/conf/config.go b/conf/config.go
+index 730e0315..3ce359cd 100644
+--- a/conf/config.go
++++ b/conf/config.go
+@@ -33,9 +33,10 @@ type (
+ )
+ 
+ type Config struct {
+-	Name      string
+-	Interface Interface
+-	Peers     []Peer
++	Name             string
++	StartWithWindows bool
++	Interface        Interface
++	Peers            []Peer
+ 
+ 	TrailingComments []string
+ }
+diff --git a/conf/parser.go b/conf/parser.go
+index 0882faa4..3e29107b 100644
+--- a/conf/parser.go
++++ b/conf/parser.go
+@@ -145,6 +145,8 @@ func splitList(s string) ([]string, error) {
+ 
+ type parserState int
+ 
++const startWithWindowsKey = "WireGuard: StartWithWindows"
++
+ const (
+ 	inInterfaceSection parserState = iota
+ 	inPeerSection
+@@ -175,6 +177,19 @@ func FromWgQuick(s, name string) (*Config, error) {
+ 		}
+ 		stripped := strings.TrimSpace(code)
+ 		if len(stripped) == 0 {
++			// Keep Windows startup metadata in a comment so exports remain
++			// compatible with other WireGuard clients.
++			if parserState == notInASection && hasComment {
++				key, value, hasValue := strings.Cut(strings.TrimSpace(after), "=")
++				if hasValue && strings.EqualFold(strings.TrimSpace(key), startWithWindowsKey) {
++					startWithWindows, err := strconv.ParseBool(strings.TrimSpace(value))
++					if err != nil {
++						return nil, &ParseError{l18n.Sprintf("Invalid Windows startup setting"), value}
++					}
++					conf.StartWithWindows = startWithWindows
++					continue
++				}
++			}
+ 			if len(comment) != 0 {
+ 				pendingComments = append(pendingComments, comment)
+ 			} else {
+@@ -422,7 +437,8 @@ func FromWgQuickWithUnknownEncoding(s, name string) (*Config, error) {
+ 
+ func FromDriverConfiguration(interfaze *driver.Interface, existingConfig *Config) *Config {
+ 	conf := Config{
+-		Name: existingConfig.Name,
++		Name:             existingConfig.Name,
++		StartWithWindows: existingConfig.StartWithWindows,
+ 		Interface: Interface{
+ 			Addresses: existingConfig.Interface.Addresses,
+ 			DNS:       existingConfig.Interface.DNS,
+diff --git a/conf/startup_test.go b/conf/startup_test.go
+new file mode 100644
+index 00000000..5bf3ff92
+--- /dev/null
++++ b/conf/startup_test.go
+@@ -0,0 +1,93 @@
++/* SPDX-License-Identifier: MIT
++ *
++ * Copyright (C) 2026 WireGuard LLC. All Rights Reserved.
++ */
++
++package conf
++
++import (
++	"strings"
++	"testing"
++
++	"golang.zx2c4.com/wireguard/windows/driver"
++)
++
++func TestStartWithWindows(t *testing.T) {
++	for _, tc := range []struct {
++		name   string
++		prefix string
++		want   bool
++	}{
++		{"default", "", false},
++		{"enabled", "# WireGuard: StartWithWindows = true\n", true},
++		{"disabled", "# WireGuard: StartWithWindows = false\n", false},
++		{"whitespace", "  # wireguard: startwithwindows = true \r\n", true},
++		{"ordinary comment", "# StartWithWindows = true\n", false},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			c, err := FromWgQuick(tc.prefix+testInput, "test")
++			if !noError(t, err) {
++				return
++			}
++			equal(t, tc.want, c.StartWithWindows)
++			reparsed, err := FromWgQuick(c.ToWgQuick(), "renamed")
++			if noError(t, err) {
++				equal(t, tc.want, reparsed.StartWithWindows)
++				equal(t, c.Interface, reparsed.Interface)
++				equal(t, c.Peers, reparsed.Peers)
++			}
++		})
++	}
++}
++
++func TestStartWithWindowsRoundTrip(t *testing.T) {
++	c, err := FromWgQuick("# user comment\n"+testInput, "test")
++	if !noError(t, err) {
++		return
++	}
++	c.StartWithWindows = true
++	exported := c.ToWgQuick()
++	reparsed, err := FromWgQuick(exported, "test")
++	if !noError(t, err) {
++		return
++	}
++	equal(t, c, reparsed)
++	equal(t, exported, reparsed.ToWgQuick())
++	if strings.Count(exported, "# WireGuard: StartWithWindows = true\n") != 1 {
++		t.Fatal("expected exactly one startup preference comment")
++	}
++
++	// Clearing the checkbox must remove the preference instead of retaining
++	// a stale comment that re-enables automatic startup on the next load.
++	reparsed.StartWithWindows = false
++	manual := reparsed.ToWgQuick()
++	if strings.Contains(manual, startWithWindowsKey) {
++		t.Fatal("disabled startup preference remained in the exported config")
++	}
++	c.StartWithWindows = false
++	reparsed, err = FromWgQuick(manual, "test")
++	if noError(t, err) {
++		equal(t, c, reparsed)
++	}
++}
++
++func TestStartWithWindowsComments(t *testing.T) {
++	if _, err := FromWgQuick("# WireGuard: StartWithWindows = invalid\n"+testInput, "test"); err == nil {
++		t.Error("accepted an invalid startup preference")
++	}
++
++	// Only standalone metadata before the interface section is interpreted.
++	c, err := FromWgQuick(testInput+"\n# WireGuard: StartWithWindows = true\n", "test")
++	if noError(t, err) {
++		equal(t, false, c.StartWithWindows)
++		equal(t, []string{"# WireGuard: StartWithWindows = true"}, c.TrailingComments)
++	}
++}
++
++func TestRuntimeConfigStartWithWindows(t *testing.T) {
++	for _, enabled := range []bool{false, true} {
++		stored := &Config{Name: "test", StartWithWindows: enabled}
++		runtime := FromDriverConfiguration(&driver.Interface{}, stored)
++		equal(t, enabled, runtime.StartWithWindows)
++	}
++}
+diff --git a/conf/writer.go b/conf/writer.go
+index d29c9a2f..2c6726f8 100644
+--- a/conf/writer.go
++++ b/conf/writer.go
+@@ -18,6 +18,9 @@ import (
+ 
+ func (conf *Config) ToWgQuick() string {
+ 	var output strings.Builder
++	if conf.StartWithWindows {
++		output.WriteString("# " + startWithWindowsKey + " = true\n")
++	}
+ 
+ 	writeLine := func(c Comments, line string) {
+ 		for _, before := range c.Before {
+diff --git a/docs/enterprise.md b/docs/enterprise.md
+index 8430cc99..3b8c321a 100644
+--- a/docs/enterprise.md
++++ b/docs/enterprise.md
+@@ -21,6 +21,10 @@ A tunnel service may be installed or uninstalled using the commands:
+ 
+ This creates a service called `WireGuardTunnel$myconfname`, which can be controlled using standard Windows service management utilites, such as `services.msc` or [`sc`](https://docs.microsoft.com/en-us/windows-server/administration/windows-commands/sc-query).
+ 
++The tunnel service is started immediately when installed or activated from the UI. By default, it uses manual startup and does not start automatically after Windows restarts. To reconnect an active tunnel after a restart, select **Start with Windows** in the tunnel's create/edit dialog. This preference is saved per tunnel; the UI creates its service with automatic startup when selected, and manual startup otherwise. Deactivating a tunnel removes its service, so it will no longer start with Windows. Editing an active tunnel reapplies the selected startup setting when the tunnel restarts.
++
++The preference is stored in a `# WireGuard: StartWithWindows = true` comment before the `[Interface]` section, so it survives export/import and remains compatible with other WireGuard clients. Configurations without this comment default to manual startup. The `/installtunnelservice` command always installs the service with manual startup; its startup type can also be changed using standard Windows service management tools. Services installed by older versions retain their existing startup setting until they are reinstalled, or deactivated and activated again from the UI.
++
+ If the configuration filename ends in `.conf`, it is interpreted as a normal [`wg-quick(8)`](https://git.zx2c4.com/wireguard-tools/about/src/man/wg-quick.8) configuration file. If it ends in `.conf.dpapi`, it is considered to be that same configuration file, but encrypted using [`CryptProtectData(bytes, "myconfname")`](https://docs.microsoft.com/en-us/windows/win32/api/dpapi/nf-dpapi-cryptprotectdata).
+ 
+ The tunnel service may be queried and modified at runtime using the standard [`wg(8)`](https://git.zx2c4.com/wireguard-tools/about/src/man/wg.8) command line utility. If the configuration file is a `.conf.dpapi` one, then Local System or Administrator permissions is required to interact with it using `wg(8)`; otherwise users of `wg(8)` must have Local System or Administrator permissions, or permissions the same as the owner of the `.conf` file. Invocation of `wg(8)` follows usual patterns on other platforms. For example:
+diff --git a/locales/en/messages.gotext.json b/locales/en/messages.gotext.json
+index 36dd6d1f..6c88670d 100644
+--- a/locales/en/messages.gotext.json
++++ b/locales/en/messages.gotext.json
+@@ -1,6 +1,21 @@
+ {
+     "language": "en",
+     "messages": [
++        {
++            "id": "Start with &Windows",
++            "message": "Start with &Windows",
++            "translation": "Start with &Windows"
++        },
++        {
++            "id": "When this tunnel is active, reconnect automatically after Windows restarts. Deactivating the tunnel prevents it from starting with Windows.",
++            "message": "When this tunnel is active, reconnect automatically after Windows restarts. Deactivating the tunnel prevents it from starting with Windows.",
++            "translation": "When this tunnel is active, reconnect automatically after Windows restarts. Deactivating the tunnel prevents it from starting with Windows."
++        },
++        {
++            "id": "Invalid Windows startup setting",
++            "message": "Invalid Windows startup setting",
++            "translation": "Invalid Windows startup setting"
++        },
+         {
+             "id": "Error",
+             "message": "Error",
+@@ -1911,4 +1926,4 @@
+             "fuzzy": true
+         }
+     ]
+-}
+\ No newline at end of file
++}
+diff --git a/locales/pt-BR/messages.gotext.json b/locales/pt-BR/messages.gotext.json
+index a813cac7..7a8869e2 100644
+--- a/locales/pt-BR/messages.gotext.json
++++ b/locales/pt-BR/messages.gotext.json
+@@ -1,6 +1,21 @@
+ {
+     "language": "pt-BR",
+     "messages": [
++        {
++            "id": "Start with &Windows",
++            "message": "Start with &Windows",
++            "translation": "Iniciar com o &Windows"
++        },
++        {
++            "id": "When this tunnel is active, reconnect automatically after Windows restarts. Deactivating the tunnel prevents it from starting with Windows.",
++            "message": "When this tunnel is active, reconnect automatically after Windows restarts. Deactivating the tunnel prevents it from starting with Windows.",
++            "translation": "Quando esta conexão estiver ativa, reconectar automaticamente após reiniciar o Windows. Desativar a conexão impede que ela inicie com o Windows."
++        },
++        {
++            "id": "Invalid Windows startup setting",
++            "message": "Invalid Windows startup setting",
++            "translation": "Configuração de inicialização do Windows inválida"
++        },
+         {
+             "id": "Error",
+             "message": "Error",
+@@ -1739,4 +1754,4 @@
+             "translatorComment": "Copied from source."
+         }
+     ]
+-}
+\ No newline at end of file
++}
+diff --git a/locales/pt-PT/messages.gotext.json b/locales/pt-PT/messages.gotext.json
+index 5d127936..eb3153fe 100644
+--- a/locales/pt-PT/messages.gotext.json
++++ b/locales/pt-PT/messages.gotext.json
+@@ -1,6 +1,21 @@
+ {
+     "language": "pt-PT",
+     "messages": [
++        {
++            "id": "Start with &Windows",
++            "message": "Start with &Windows",
++            "translation": "Iniciar com o &Windows"
++        },
++        {
++            "id": "When this tunnel is active, reconnect automatically after Windows restarts. Deactivating the tunnel prevents it from starting with Windows.",
++            "message": "When this tunnel is active, reconnect automatically after Windows restarts. Deactivating the tunnel prevents it from starting with Windows.",
++            "translation": "Quando este túnel estiver ativo, restabelecer automaticamente a ligação após reiniciar o Windows. Desativar o túnel impede que este inicie com o Windows."
++        },
++        {
++            "id": "Invalid Windows startup setting",
++            "message": "Invalid Windows startup setting",
++            "translation": "Configuração de arranque do Windows inválida"
++        },
+         {
+             "id": "Error",
+             "message": "Error",
+@@ -1730,4 +1745,4 @@
+             "translatorComment": "Copied from source."
+         }
+     ]
+-}
+\ No newline at end of file
++}
+diff --git a/main.go b/main.go
+index dafa17b3..9f5c2e30 100644
+--- a/main.go
++++ b/main.go
+@@ -218,7 +218,7 @@ func main() {
+ 		if len(os.Args) != 3 {
+ 			usage()
+ 		}
+-		err := manager.InstallTunnel(os.Args[2])
++		err := manager.InstallTunnel(os.Args[2], false)
+ 		if err != nil {
+ 			fatal(err)
+ 		}
+diff --git a/manager/install.go b/manager/install.go
+index fa2e8243..bb1a1729 100644
+--- a/manager/install.go
++++ b/manager/install.go
+@@ -117,7 +117,7 @@ func UninstallManager() error {
+ 	return err2
+ }
+ 
+-func InstallTunnel(configPath string) error {
++func InstallTunnel(configPath string, startWithWindows bool) error {
+ 	m, err := serviceManager()
+ 	if err != nil {
+ 		return err
+@@ -166,12 +166,15 @@ func InstallTunnel(configPath string) error {
+ 
+ 	config := mgr.Config{
+ 		ServiceType:  windows.SERVICE_WIN32_OWN_PROCESS,
+-		StartType:    mgr.StartAutomatic,
++		StartType:    mgr.StartManual,
+ 		ErrorControl: mgr.ErrorNormal,
+ 		Dependencies: []string{"Nsi", "TcpIp"},
+ 		DisplayName:  "WireGuard Tunnel: " + name,
+ 		SidType:      windows.SERVICE_SID_TYPE_UNRESTRICTED,
+ 	}
++	if startWithWindows {
++		config.StartType = mgr.StartAutomatic
++	}
+ 	service, err = m.CreateService(serviceName, path, config, "/tunnelservice", configPath)
+ 	if err != nil {
+ 		return err
+diff --git a/manager/ipc_server.go b/manager/ipc_server.go
+index 4b81d817..fc12e0d4 100644
+--- a/manager/ipc_server.go
++++ b/manager/ipc_server.go
+@@ -116,7 +116,7 @@ func (s *ManagerService) Start(tunnelName string) error {
+ 	if err != nil {
+ 		return err
+ 	}
+-	return InstallTunnel(path)
++	return InstallTunnel(path, c.StartWithWindows)
+ }
+ 
+ func (s *ManagerService) Stop(tunnelName string) error {
+diff --git a/ui/editdialog.go b/ui/editdialog.go
+index 78de302d..2d1b25ec 100644
+--- a/ui/editdialog.go
++++ b/ui/editdialog.go
+@@ -24,6 +24,7 @@ type EditDialog struct {
+ 	nameEdit                        *walk.LineEdit
+ 	pubkeyEdit                      *walk.LineEdit
+ 	syntaxEdit                      *syntax.SyntaxEdit
++	startWithWindowsCB              *walk.CheckBox
+ 	blockUntunneledTrafficCB        *walk.CheckBox
+ 	saveButton                      *walk.PushButton
+ 	config                          conf.Config
+@@ -118,11 +119,19 @@ func newEditDialog(owner walk.Form, tunnel *manager.Tunnel) (*EditDialog, error)
+ 	}
+ 	layout.SetRange(dlg.syntaxEdit, walk.Rectangle{0, 2, 2, 1})
+ 
++	if dlg.startWithWindowsCB, err = walk.NewCheckBox(dlg); err != nil {
++		return nil, err
++	}
++	layout.SetRange(dlg.startWithWindowsCB, walk.Rectangle{0, 3, 2, 1})
++	dlg.startWithWindowsCB.SetText(l18n.Sprintf("Start with &Windows"))
++	dlg.startWithWindowsCB.SetToolTipText(l18n.Sprintf("When this tunnel is active, reconnect automatically after Windows restarts. Deactivating the tunnel prevents it from starting with Windows."))
++	dlg.startWithWindowsCB.SetChecked(dlg.config.StartWithWindows)
++
+ 	buttonsContainer, err := walk.NewComposite(dlg)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	layout.SetRange(buttonsContainer, walk.Rectangle{0, 3, 2, 1})
++	layout.SetRange(buttonsContainer, walk.Rectangle{0, 4, 2, 1})
+ 	buttonsContainer.SetLayout(walk.NewHBoxLayout())
+ 	buttonsContainer.Layout().SetMargins(walk.Margins{})
+ 
+@@ -154,7 +163,10 @@ func newEditDialog(owner walk.Form, tunnel *manager.Tunnel) (*EditDialog, error)
+ 
+ 	dlg.syntaxEdit.PrivateKeyChanged().Attach(dlg.onSyntaxEditPrivateKeyChanged)
+ 	dlg.syntaxEdit.BlockUntunneledTrafficStateChanged().Attach(dlg.onBlockUntunneledTrafficStateChanged)
+-	dlg.syntaxEdit.SetText(dlg.config.ToWgQuick())
++	// Startup is edited through the checkbox instead of the configuration text.
++	editorConfig := dlg.config
++	editorConfig.StartWithWindows = false
++	dlg.syntaxEdit.SetText(editorConfig.ToWgQuick())
+ 
+ 	// Insert a dummy label immediately preceding syntaxEdit to have screen readers read it.
+ 	// Otherwise they fallback to "RichEdit Control".
+@@ -340,6 +352,7 @@ func (dlg *EditDialog) onSaveButtonClicked() {
+ 		return
+ 	}
+ 
++	cfg.StartWithWindows = dlg.startWithWindowsCB.Checked()
+ 	dlg.config = *cfg
+ 	dlg.Accept()
+ }
+diff --git a/zgotext.go b/zgotext.go
+index 2bc345bf..564e48bd 100644
+--- a/zgotext.go
++++ b/zgotext.go
+@@ -172,6 +172,7 @@ var messageKeyToIndex = map[string]int{
+ 	"Interface: %s":                                                                               68,
+ 	"Invalid IP address: ":                                                                        19,
+ 	"Invalid MTU":                                                                                 23,
++	"Invalid Windows startup setting":                                                             179,
+ 	"Invalid endpoint host":                                                                       21,
+ 	"Invalid key for [Interface] section":                                                         33,
+ 	"Invalid key for [Peer] section":                                                              34,
+@@ -197,6 +198,7 @@ var messageKeyToIndex = map[string]int{
+ 	"Remove selected tunnel(s)":                                                                   128,
+ 	"Scripts:":                                                                                    49,
+ 	"Select &all":                                                                                 96,
++	"Start with &Windows":                                                                         180,
+ 	"Status:":                                                                                     174,
+ 	"Status: %s":                                                                                  175,
+ 	"Status: Complete!":                                                                           166,
+@@ -231,6 +233,7 @@ var messageKeyToIndex = map[string]int{
+ 	"Update Now":       161,
+ 	"Usage: %s [\n%s]": 3,
+ 	"When a configuration has exactly one peer, and that peer has an allowed IPs containing at least one of 0.0.0.0/0 or ::/0, and the interface does not have table off, then the tunnel service engages a firewall ruleset to block all traffic that is neither to nor from the tunnel interface or is to the wrong DNS server, with special exceptions for DHCP and NDP.": 76,
++	"When this tunnel is active, reconnect automatically after Windows restarts. Deactivating the tunnel prevents it from starting with Windows.": 181,
+ 	"WireGuard Activated":        115,
+ 	"WireGuard Deactivated":      117,
+ 	"WireGuard Detection Error":  106,
+@@ -258,7 +261,7 @@ var messageKeyToIndex = map[string]int{
+ 	"♥ &Donate!":                        42,
+ }
+ 
+-var afIndex = []uint32{ // 180 elements
++var afIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000005, 0x00000010, 0x0000004d,
+ 	0x00000065, 0x00000077, 0x000000b0, 0x000000f9,
+@@ -310,7 +313,8 @@ var afIndex = []uint32{ // 180 elements
+ 	0x000014b4, 0x000014b4, 0x000014b4, 0x000014b4,
+ 	0x000014b4, 0x000014b4, 0x000014b4, 0x000014b4,
+ 	0x000014b4, 0x000014b4, 0x000014b4, 0x000014b4,
+-} // Size: 744 bytes
++	0x000014b4, 0x000014b4, 0x000014b4,
++} // Size: 756 bytes
+ 
+ const afData string = "" + // Size: 5300 bytes
+ 	"\x02Fout\x04\x00\x01 \x06\x02Fout:\x02(geen argument): verhoog regte en " +
+@@ -399,7 +403,7 @@ const afData string = "" + // Size: 5300 bytes
+ 	" Wag vir administrateur\x02Status: Wag vir bywerkingsdiens\x02Fout: %[1]" +
+ 	"v. Probeer asseblief weer.\x02Status: Voltooid!"
+ 
+-var arIndex = []uint32{ // 180 elements
++var arIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000007, 0x00000014, 0x0000006e,
+ 	0x00000091, 0x000000b4, 0x00000116, 0x00000182,
+@@ -451,7 +455,8 @@ var arIndex = []uint32{ // 180 elements
+ 	0x00002274, 0x0000228e, 0x000022a8, 0x000022c2,
+ 	0x000022dc, 0x000022e0, 0x000022e4, 0x000022f2,
+ 	0x00002306, 0x00002306, 0x00002306, 0x00002306,
+-} // Size: 744 bytes
++	0x00002306, 0x00002306, 0x00002306,
++} // Size: 756 bytes
+ 
+ const arData string = "" + // Size: 8966 bytes
+ 	"\x02خطأ\x04\x00\x01 \x08\x02خطأ:\x02(بدون معطيات): تصعيد الصلاحيات وتثبي" +
+@@ -549,7 +554,7 @@ const arData string = "" + // Size: 8966 bytes
+ 	"\x02%.2[1]f\u00a0ميبيبايت\x02%.2[1]f\u00a0جيبيبايت\x02%.2[1]f\u00a0تيبيب" +
+ 	"ايت\x02، \x02، \x02الحالة:\x02الحالة: %[1]s"
+ 
+-var caIndex = []uint32{ // 180 elements
++var caIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000006, 0x00000006, 0x00000045,
+ 	0x00000059, 0x00000074, 0x000000b3, 0x000000f9,
+@@ -601,7 +606,8 @@ var caIndex = []uint32{ // 180 elements
+ 	0x00001673, 0x00001680, 0x0000168d, 0x0000169a,
+ 	0x000016a7, 0x000016a7, 0x000016a7, 0x000016ae,
+ 	0x000016bb, 0x000016c8, 0x000016cd, 0x000016de,
+-} // Size: 744 bytes
++	0x000016de, 0x000016de, 0x000016de,
++} // Size: 756 bytes
+ 
+ const caData string = "" + // Size: 5854 bytes
+ 	"\x02Error\x02(sense argument): eleva i instal·la el servei d'administrad" +
+@@ -697,7 +703,7 @@ const caData string = "" + // Size: 5854 bytes
+ 	"\x02%.2[1]f\u00a0TiB\x02Estat:\x02Estat: %[1]s\x02%[1]s: %[2]q\x02MTU:" +
+ 	"\x02WireGuard: %[1]s"
+ 
+-var csIndex = []uint32{ // 180 elements
++var csIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000006, 0x00000012, 0x0000005b,
+ 	0x00000075, 0x00000096, 0x000000c9, 0x00000112,
+@@ -749,7 +755,8 @@ var csIndex = []uint32{ // 180 elements
+ 	0x0000173f, 0x0000174c, 0x00001759, 0x00001766,
+ 	0x00001773, 0x00001773, 0x00001773, 0x00001779,
+ 	0x00001785, 0x00001792, 0x00001797, 0x000017a8,
+-} // Size: 744 bytes
++	0x000017a8, 0x000017a8, 0x000017a8,
++} // Size: 756 bytes
+ 
+ const csData string = "" + // Size: 6056 bytes
+ 	"\x02Chyba\x04\x00\x01 \x07\x02Chyba:\x02(žádný argument): Zvýšit oprávně" +
+@@ -848,7 +855,7 @@ const csData string = "" + // Size: 6056 bytes
+ 	".2[1]f\u00a0TiB\x02Stav:\x02Stav: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireG" +
+ 	"uard: %[1]s"
+ 
+-var daIndex = []uint32{ // 180 elements
++var daIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000005, 0x00000010, 0x00000048,
+ 	0x0000005d, 0x00000078, 0x000000b0, 0x000000f2,
+@@ -900,7 +907,8 @@ var daIndex = []uint32{ // 180 elements
+ 	0x000014a1, 0x000014ae, 0x000014bb, 0x000014c8,
+ 	0x000014d5, 0x000014d5, 0x000014d5, 0x000014dd,
+ 	0x000014eb, 0x000014f8, 0x000014fd, 0x0000150e,
+-} // Size: 744 bytes
++	0x0000150e, 0x0000150e, 0x0000150e,
++} // Size: 756 bytes
+ 
+ const daData string = "" + // Size: 5390 bytes
+ 	"\x02Fejl\x04\x00\x01 \x06\x02Fejl:\x02(intet argument): ophøj og install" +
+@@ -990,7 +998,7 @@ const daData string = "" + // Size: 5390 bytes
+ 	"]f\u00a0KiB\x02%.2[1]f\u00a0MiB\x02%.2[1]f\u00a0GiB\x02%.2[1]f\u00a0TiB" +
+ 	"\x02Status:\x02Status: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireGuard: %[1]s"
+ 
+-var deIndex = []uint32{ // 180 elements
++var deIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000007, 0x00000014, 0x00000066,
+ 	0x00000081, 0x00000098, 0x000000ee, 0x0000013a,
+@@ -1042,7 +1050,8 @@ var deIndex = []uint32{ // 180 elements
+ 	0x000017d8, 0x000017e5, 0x000017f2, 0x000017ff,
+ 	0x0000180c, 0x0000180c, 0x0000180c, 0x00001814,
+ 	0x00001822, 0x0000182f, 0x00001834, 0x00001845,
+-} // Size: 744 bytes
++	0x00001845, 0x00001845, 0x00001845,
++} // Size: 756 bytes
+ 
+ const deData string = "" + // Size: 6213 bytes
+ 	"\x02Fehler\x04\x00\x01 \x08\x02Fehler:\x02(kein Argument): Als Administr" +
+@@ -1144,7 +1153,7 @@ const deData string = "" + // Size: 6213 bytes
+ 	"%.2[1]f\u00a0TiB\x02Status:\x02Status: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02" +
+ 	"WireGuard: %[1]s"
+ 
+-var elIndex = []uint32{ // 180 elements
++var elIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x0000000d, 0x00000020, 0x000000a9,
+ 	0x000000c4, 0x000000f3, 0x00000176, 0x00000206,
+@@ -1196,7 +1205,8 @@ var elIndex = []uint32{ // 180 elements
+ 	0x000028d3, 0x000028e0, 0x000028ed, 0x000028fa,
+ 	0x00002907, 0x00002907, 0x00002907, 0x0000291b,
+ 	0x00002935, 0x00002942, 0x00002947, 0x00002958,
+-} // Size: 744 bytes
++	0x00002958, 0x00002958, 0x00002958,
++} // Size: 756 bytes
+ 
+ const elData string = "" + // Size: 10584 bytes
+ 	"\x02Σφάλμα\x04\x00\x01 \x0e\x02Σφάλμα:\x02(χωρίς όρισμα): ανύψωση δικαιω" +
+@@ -1300,7 +1310,7 @@ const elData string = "" + // Size: 10584 bytes
+ 	"\x02Κατάσταση:\x02Κατάσταση: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireGuard:" +
+ 	" %[1]s"
+ 
+-var enIndex = []uint32{ // 180 elements
++var enIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000006, 0x00000012, 0x00000045,
+ 	0x0000005b, 0x00000070, 0x000000b6, 0x000000f5,
+@@ -1352,9 +1362,10 @@ var enIndex = []uint32{ // 180 elements
+ 	0x0000137a, 0x00001387, 0x00001394, 0x000013a1,
+ 	0x000013ae, 0x000013c5, 0x000013d5, 0x000013dd,
+ 	0x000013eb, 0x000013f8, 0x000013fd, 0x0000140e,
+-} // Size: 744 bytes
++	0x0000142e, 0x00001442, 0x000014ce,
++} // Size: 756 bytes
+ 
+-const enData string = "" + // Size: 5134 bytes
++const enData string = "" + // Size: 5326 bytes
+ 	"\x02Error\x04\x00\x01 \x07\x02Error:\x02(no argument): elevate and insta" +
+ 	"ll manager service\x02Usage: %[1]s [\x0a%[2]s]\x02Command Line Options" +
+ 	"\x02Unable to determine whether the process is running under WOW64: %[1]" +
+@@ -1438,9 +1449,12 @@ const enData string = "" + // Size: 5134 bytes
+ 	"Please try again.\x02Status: Complete!\x02%[1]d\u00a0B\x02%.2[1]f\u00a0K" +
+ 	"iB\x02%.2[1]f\u00a0MiB\x02%.2[1]f\u00a0GiB\x02%.2[1]f\u00a0TiB\x02[Enume" +
+ 	"rationSeparator]\x02[UnitSeparator]\x02Status:\x02Status: %[1]s\x02%[1]s" +
+-	": %[2]q\x02MTU:\x02WireGuard: %[1]s"
++	": %[2]q\x02MTU:\x02WireGuard: %[1]s\x02Invalid Windows startup setting" +
++	"\x02Start with &Windows\x02When this tunnel is active, reconnect automat" +
++	"ically after Windows restarts. Deactivating the tunnel prevents it from " +
++	"starting with Windows."
+ 
+-var es_ESIndex = []uint32{ // 180 elements
++var es_ESIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000006, 0x00000006, 0x00000044,
+ 	0x00000058, 0x00000077, 0x000000c5, 0x000000ff,
+@@ -1492,7 +1506,8 @@ var es_ESIndex = []uint32{ // 180 elements
+ 	0x0000177c, 0x00001788, 0x00001794, 0x000017a0,
+ 	0x000017ac, 0x000017ac, 0x000017ac, 0x000017b4,
+ 	0x000017c2, 0x000017cf, 0x000017d4, 0x000017e5,
+-} // Size: 744 bytes
++	0x000017e5, 0x000017e5, 0x000017e5,
++} // Size: 756 bytes
+ 
+ const es_ESData string = "" + // Size: 6117 bytes
+ 	"\x02Error\x02(sin argumento): eleve e instale el servicio de administrad" +
+@@ -1592,7 +1607,7 @@ const es_ESData string = "" + // Size: 6117 bytes
+ 	"%.2[1]f TiB\x02Estado:\x02Estado: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireG" +
+ 	"uard: %[1]s"
+ 
+-var etIndex = []uint32{ // 180 elements
++var etIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000005, 0x00000010, 0x00000047,
+ 	0x00000060, 0x00000071, 0x000000b9, 0x00000101,
+@@ -1644,7 +1659,8 @@ var etIndex = []uint32{ // 180 elements
+ 	0x00001515, 0x00001522, 0x0000152f, 0x0000153c,
+ 	0x00001549, 0x00001549, 0x00001549, 0x00001552,
+ 	0x00001561, 0x0000156e, 0x00001573, 0x00001584,
+-} // Size: 744 bytes
++	0x00001584, 0x00001584, 0x00001584,
++} // Size: 756 bytes
+ 
+ const etData string = "" + // Size: 5508 bytes
+ 	"\x02Viga\x04\x00\x01 \x06\x02Viga:\x02(tühi muutuja): paigalda haldustee" +
+@@ -1736,7 +1752,7 @@ const etData string = "" + // Size: 5508 bytes
+ 	"\u00a0TiB\x02Staatus:\x02Staatus: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireG" +
+ 	"uard: %[1]s"
+ 
+-var faIndex = []uint32{ // 180 elements
++var faIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000007, 0x00000014, 0x00000068,
+ 	0x00000087, 0x000000ab, 0x0000010b, 0x0000016e,
+@@ -1788,7 +1804,8 @@ var faIndex = []uint32{ // 180 elements
+ 	0x00002019, 0x00002026, 0x00002033, 0x00002040,
+ 	0x0000204d, 0x00002051, 0x00002055, 0x00002061,
+ 	0x00002073, 0x00002080, 0x00002085, 0x00002096,
+-} // Size: 744 bytes
++	0x00002096, 0x00002096, 0x00002096,
++} // Size: 756 bytes
+ 
+ const faData string = "" + // Size: 8342 bytes
+ 	"\x02خطا\x04\x00\x01 \x08\x02خطا:\x02(بدون ورودیی): سرویس مدیریت را ارتقا" +
+@@ -1879,7 +1896,7 @@ const faData string = "" + // Size: 8342 bytes
+ 	"%.2[1]f\u00a0MiB\x02%.2[1]f\u00a0GiB\x02%.2[1]f\u00a0TiB\x02، \x02، \x02" +
+ 	"وضعیت:\x02وضعیت: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireGuard: %[1]s"
+ 
+-var fiIndex = []uint32{ // 180 elements
++var fiIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000006, 0x00000012, 0x00000062,
+ 	0x0000007b, 0x00000091, 0x000000f6, 0x0000013a,
+@@ -1931,7 +1948,8 @@ var fiIndex = []uint32{ // 180 elements
+ 	0x00001624, 0x00001631, 0x0000163e, 0x0000164b,
+ 	0x00001658, 0x00001658, 0x00001658, 0x0000165e,
+ 	0x0000166a, 0x00001677, 0x0000167c, 0x0000168d,
+-} // Size: 744 bytes
++	0x0000168d, 0x0000168d, 0x0000168d,
++} // Size: 756 bytes
+ 
+ const fiData string = "" + // Size: 5773 bytes
+ 	"\x02Virhe\x04\x00\x01 \x07\x02Virhe:\x02(ei määrityksiä): suorita järjes" +
+@@ -2025,7 +2043,7 @@ const fiData string = "" + // Size: 5773 bytes
+ 	"\x02%.2[1]f\u00a0TiB\x02Tila:\x02Tila: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02" +
+ 	"WireGuard: %[1]s"
+ 
+-var frIndex = []uint32{ // 180 elements
++var frIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000007, 0x00000015, 0x00000054,
+ 	0x00000071, 0x00000091, 0x000000d9, 0x00000120,
+@@ -2077,7 +2095,8 @@ var frIndex = []uint32{ // 180 elements
+ 	0x0000186d, 0x0000187a, 0x00001887, 0x00001894,
+ 	0x000018a1, 0x000018a1, 0x000018a3, 0x000018ab,
+ 	0x000018b9, 0x000018c7, 0x000018cd, 0x000018df,
+-} // Size: 744 bytes
++	0x000018df, 0x000018df, 0x000018df,
++} // Size: 756 bytes
+ 
+ const frData string = "" + // Size: 6367 bytes
+ 	"\x02Erreur\x04\x00\x01 \x09\x02Erreur :\x02(sans argument) : élever et i" +
+@@ -2180,7 +2199,7 @@ const frData string = "" + // Size: 6367 bytes
+ 	".2[1]f\u00a0Tio\x02 \x02État :\x02État : %[1]s\x02%[1]s : %[2]q\x02MTU :" +
+ 	"\x02WireGuard : %[1]s"
+ 
+-var heIndex = []uint32{ // 180 elements
++var heIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x0000000b, 0x0000001c, 0x00000070,
+ 	0x0000008b, 0x000000b0, 0x000000f8, 0x00000144,
+@@ -2232,7 +2251,8 @@ var heIndex = []uint32{ // 180 elements
+ 	0x00001cae, 0x00001cae, 0x00001cae, 0x00001cae,
+ 	0x00001cae, 0x00001cae, 0x00001cae, 0x00001cb6,
+ 	0x00001cc4, 0x00001cc4, 0x00001cc4, 0x00001cc4,
+-} // Size: 744 bytes
++	0x00001cc4, 0x00001cc4, 0x00001cc4,
++} // Size: 756 bytes
+ 
+ const heData string = "" + // Size: 7364 bytes
+ 	"\x02שגיאה\x04\x00\x01 \x0c\x02שגיאה:\x02(ללא ארגומנט): העלאת הרשאות והתק" +
+@@ -2314,7 +2334,7 @@ const heData string = "" + // Size: 7364 bytes
+ 	".\x02מצב: ממתין למנהל המערכת\x02מצב: ממתין לשירות העדכון\x02שגיאה: %[1]v" +
+ 	". אנא נסה שוב.\x02מצב: הושלם!\x02מצב:\x02מצב: %[1]s"
+ 
+-var hiIndex = []uint32{ // 180 elements
++var hiIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000013, 0x0000002c, 0x000000e1,
+ 	0x00000101, 0x00000131, 0x000001f7, 0x00000293,
+@@ -2366,7 +2386,8 @@ var hiIndex = []uint32{ // 180 elements
+ 	0x00002e78, 0x00002e78, 0x00002e78, 0x00002e78,
+ 	0x00002e78, 0x00002e78, 0x00002e78, 0x00002e8c,
+ 	0x00002ea6, 0x00002ea6, 0x00002ea6, 0x00002ea6,
+-} // Size: 744 bytes
++	0x00002ea6, 0x00002ea6, 0x00002ea6,
++} // Size: 756 bytes
+ 
+ const hiData string = "" + // Size: 11942 bytes
+ 	"\x02त्रुटि\x04\x00\x01 \x14\x02त्रुटि:\x02(कोई आर्ग्युमेंट नहीं): अधिकार" +
+@@ -2455,7 +2476,7 @@ const hiData string = "" + // Size: 11942 bytes
+ 	"्थिति: अद्यतनकर्ता सेवा की प्रतीक्षा में\x02त्रुटि: %[1]v. कृपया पुनः " +
+ 	"प्रयास करें।\x02स्थिति: पूर्ण!\x02स्थिति:\x02स्थिति: %[1]s"
+ 
+-var huIndex = []uint32{ // 180 elements
++var huIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000005, 0x00000010, 0x00000068,
+ 	0x00000083, 0x0000009e, 0x000000df, 0x00000129,
+@@ -2507,7 +2528,8 @@ var huIndex = []uint32{ // 180 elements
+ 	0x000017ec, 0x000017ec, 0x000017ec, 0x000017ec,
+ 	0x000017ec, 0x000017ec, 0x000017ec, 0x000017f6,
+ 	0x00001806, 0x00001806, 0x00001806, 0x00001806,
+-} // Size: 744 bytes
++	0x00001806, 0x00001806, 0x00001806,
++} // Size: 756 bytes
+ 
+ const huData string = "" + // Size: 6150 bytes
+ 	"\x02Hiba\x04\x00\x01 \x06\x02Hiba:\x02(argumentum nélkül): jogosultságok" +
+@@ -2602,7 +2624,7 @@ const huData string = "" + // Size: 6150 bytes
+ 	"\x02Hiba: %[1]v. Próbálja meg újra.\x02Állapot: Befejezve!\x02Állapot:" +
+ 	"\x02Állapot: %[1]s"
+ 
+-var idIndex = []uint32{ // 180 elements
++var idIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x0000000a, 0x0000001a, 0x00000057,
+ 	0x00000072, 0x00000084, 0x000000cf, 0x0000010e,
+@@ -2654,7 +2676,8 @@ var idIndex = []uint32{ // 180 elements
+ 	0x000013e9, 0x000013f5, 0x00001401, 0x0000140d,
+ 	0x00001419, 0x00001419, 0x00001419, 0x00001421,
+ 	0x0000142f, 0x0000143c, 0x00001441, 0x00001452,
+-} // Size: 744 bytes
++	0x00001452, 0x00001452, 0x00001452,
++} // Size: 756 bytes
+ 
+ const idData string = "" + // Size: 5202 bytes
+ 	"\x02Kesalahan\x04\x00\x01 \x0b\x02Kesalahan:\x02(tidak ada argumen): nai" +
+@@ -2742,7 +2765,7 @@ const idData string = "" + // Size: 5202 bytes
+ 	"B\x02Status:\x02Status: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireGuard: %[1]" +
+ 	"s"
+ 
+-var itIndex = []uint32{ // 180 elements
++var itIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000007, 0x00000014, 0x00000051,
+ 	0x0000006a, 0x00000082, 0x000000ca, 0x00000109,
+@@ -2794,7 +2817,8 @@ var itIndex = []uint32{ // 180 elements
+ 	0x000016ae, 0x000016bb, 0x000016c8, 0x000016d5,
+ 	0x000016e2, 0x000016e2, 0x000016e4, 0x000016eb,
+ 	0x000016f8, 0x00001705, 0x0000170a, 0x0000171b,
+-} // Size: 744 bytes
++	0x0000171b, 0x0000171b, 0x0000171b,
++} // Size: 756 bytes
+ 
+ const itData string = "" + // Size: 5915 bytes
+ 	"\x02Errore\x04\x00\x01 \x08\x02Errore:\x02(nessun argomento): eleva e in" +
+@@ -2892,7 +2916,7 @@ const itData string = "" + // Size: 5915 bytes
+ 	"2[1]f\u00a0MiB\x02%.2[1]f\u00a0GiB\x02%.2[1]f\u00a0TiB\x02 \x02Stato:" +
+ 	"\x02Stato: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireGuard: %[1]s"
+ 
+-var jaIndex = []uint32{ // 180 elements
++var jaIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x0000000a, 0x0000001a, 0x00000077,
+ 	0x00000091, 0x000000b6, 0x00000102, 0x0000015c,
+@@ -2944,7 +2968,8 @@ var jaIndex = []uint32{ // 180 elements
+ 	0x00001a07, 0x00001a14, 0x00001a21, 0x00001a2e,
+ 	0x00001a3b, 0x00001a3f, 0x00001a41, 0x00001a49,
+ 	0x00001a57, 0x00001a64, 0x00001a69, 0x00001a7a,
+-} // Size: 744 bytes
++	0x00001a7a, 0x00001a7a, 0x00001a7a,
++} // Size: 756 bytes
+ 
+ const jaData string = "" + // Size: 6778 bytes
+ 	"\x02エラー\x04\x00\x01 \x0b\x02エラー:\x02(引数なし): 管理者権限でmanagerサービスをインストールしてくだ" +
+@@ -3004,7 +3029,7 @@ const jaData string = "" + // Size: 6778 bytes
+ 	"\x02、\x02 \x02状態:\x02状態: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireGuard: %[1" +
+ 	"]s"
+ 
+-var koIndex = []uint32{ // 180 elements
++var koIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000007, 0x00000014, 0x0000004b,
+ 	0x00000062, 0x00000073, 0x000000bc, 0x0000010c,
+@@ -3056,7 +3081,8 @@ var koIndex = []uint32{ // 180 elements
+ 	0x0000169a, 0x000016a7, 0x000016b4, 0x000016c1,
+ 	0x000016ce, 0x000016ce, 0x000016ce, 0x000016d6,
+ 	0x000016e4, 0x000016f1, 0x000016f6, 0x0000170d,
+-} // Size: 744 bytes
++	0x0000170d, 0x0000170d, 0x0000170d,
++} // Size: 756 bytes
+ 
+ const koData string = "" + // Size: 5901 bytes
+ 	"\x02오류\x04\x00\x01 \x08\x02오류:\x02(인수 없음): 관리자 서비스 상승 및 설치\x02사용: %[1]s " +
+@@ -3114,7 +3140,7 @@ const koData string = "" + // Size: 5901 bytes
+ 	"\u00a0MiB\x02%.2[1]f\u00a0GiB\x02%.2[1]f\u00a0TiB\x02상태:\x02상태: %[1]s" +
+ 	"\x02%[1]s: %[2]q\x02MTU:\x02와이어가드: %[1]s"
+ 
+-var lbIndex = []uint32{ // 180 elements
++var lbIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000007, 0x00000014, 0x0000006b,
+ 	0x00000086, 0x0000009e, 0x000000f2, 0x0000013b,
+@@ -3166,7 +3192,8 @@ var lbIndex = []uint32{ // 180 elements
+ 	0x0000189f, 0x000018ac, 0x000018b9, 0x000018c6,
+ 	0x000018d3, 0x000018d6, 0x000018d9, 0x000018e1,
+ 	0x000018ef, 0x000018fc, 0x00001901, 0x00001912,
+-} // Size: 744 bytes
++	0x00001912, 0x00001912, 0x00001912,
++} // Size: 756 bytes
+ 
+ const lbData string = "" + // Size: 6418 bytes
+ 	"\x02Feeler\x04\x00\x01 \x08\x02Feeler:\x02(Keen Argument): Als Administr" +
+@@ -3269,7 +3296,7 @@ const lbData string = "" + // Size: 6418 bytes
+ 	"f\u00a0MiB\x02%.2[1]f\u00a0GiB\x02%.2[1]f\u00a0TiB\x02, \x02, \x02Status" +
+ 	":\x02Status: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireGuard: %[1]s"
+ 
+-var nbIndex = []uint32{ // 180 elements
++var nbIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000005, 0x00000010, 0x00000052,
+ 	0x00000067, 0x00000079, 0x000000b3, 0x00000100,
+@@ -3321,7 +3348,8 @@ var nbIndex = []uint32{ // 180 elements
+ 	0x0000148c, 0x0000148c, 0x0000148c, 0x0000148c,
+ 	0x0000148c, 0x0000148c, 0x0000148c, 0x0000148c,
+ 	0x0000148c, 0x0000148c, 0x0000148c, 0x0000148c,
+-} // Size: 744 bytes
++	0x0000148c, 0x0000148c, 0x0000148c,
++} // Size: 756 bytes
+ 
+ const nbData string = "" + // Size: 5260 bytes
+ 	"\x02Feil\x04\x00\x01 \x06\x02Feil:\x02(ingen argument): hev rettigheter " +
+@@ -3409,7 +3437,7 @@ const nbData string = "" + // Size: 5260 bytes
+ 	"enter på administrator\x02Status: Venter på oppdateringstjenesten\x02Fei" +
+ 	"l: %[1]v. Prøv igjen.\x02Status: Fullført!"
+ 
+-var nlIndex = []uint32{ // 180 elements
++var nlIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x0000000c, 0x00000017, 0x0000005a,
+ 	0x00000078, 0x0000008f, 0x000000d2, 0x00000115,
+@@ -3461,7 +3489,8 @@ var nlIndex = []uint32{ // 180 elements
+ 	0x000015e0, 0x000015ed, 0x000015fa, 0x00001607,
+ 	0x00001614, 0x00001614, 0x00001616, 0x0000161e,
+ 	0x0000162c, 0x00001639, 0x0000163e, 0x0000164f,
+-} // Size: 744 bytes
++	0x0000164f, 0x0000164f, 0x0000164f,
++} // Size: 756 bytes
+ 
+ const nlData string = "" + // Size: 5711 bytes
+ 	"\x02Foutmelding\x04\x00\x01 \x06\x02Fout:\x02(geen argumenten): Verhoog " +
+@@ -3557,7 +3586,7 @@ const nlData string = "" + // Size: 5711 bytes
+ 	"\u00a0GiB\x02%.2[1]f\u00a0TiB\x02 \x02Status:\x02Status: %[1]s\x02%[1]s:" +
+ 	" %[2]q\x02MTU:\x02WireGuard: %[1]s"
+ 
+-var nn_NOIndex = []uint32{ // 180 elements
++var nn_NOIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000005, 0x00000010, 0x0000004b,
+ 	0x00000060, 0x00000071, 0x000000ab, 0x000000f4,
+@@ -3609,7 +3638,8 @@ var nn_NOIndex = []uint32{ // 180 elements
+ 	0x000014a8, 0x000014a8, 0x000014a8, 0x000014a8,
+ 	0x000014a8, 0x000014a8, 0x000014a8, 0x000014a8,
+ 	0x000014a8, 0x000014a8, 0x000014a8, 0x000014a8,
+-} // Size: 744 bytes
++	0x000014a8, 0x000014a8, 0x000014a8,
++} // Size: 756 bytes
+ 
+ const nn_NOData string = "" + // Size: 5288 bytes
+ 	"\x02Feil\x04\x00\x01 \x06\x02Feil:\x02(ingen argument): hev rettar og in" +
+@@ -3697,7 +3727,7 @@ const nn_NOData string = "" + // Size: 5288 bytes
+ 	" oppdatere.\x02Status: Ventar på administrator\x02Status: Ventar på oppd" +
+ 	"ateringstenesta\x02Feil: %[1]v. Prøv igjen.\x02Status: Ferdig!"
+ 
+-var pa_INIndex = []uint32{ // 180 elements
++var pa_INIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000010, 0x00000026, 0x000000c0,
+ 	0x000000e0, 0x0000010d, 0x0000019a, 0x00000238,
+@@ -3749,7 +3779,8 @@ var pa_INIndex = []uint32{ // 180 elements
+ 	0x00002e2b, 0x00002e38, 0x00002e45, 0x00002e52,
+ 	0x00002e5f, 0x00002e5f, 0x00002e5f, 0x00002e70,
+ 	0x00002e87, 0x00002e94, 0x00002e99, 0x00002eb9,
+-} // Size: 744 bytes
++	0x00002eb9, 0x00002eb9, 0x00002eb9,
++} // Size: 756 bytes
+ 
+ const pa_INData string = "" + // Size: 11961 bytes
+ 	"\x02ਗ਼ਲਤੀ\x04\x00\x01 \x11\x02ਗ਼ਲਤੀ:\x02(ਕੋਈ ਆਰਗੂਮੈਂਟ ਨਹੀਂ): ਅਧਿਕਾਰ ਉਚਾਈ" +
+@@ -3839,7 +3870,7 @@ const pa_INData string = "" + // Size: 11961 bytes
+ 	"\u00a0KiB\x02%.2[1]f\u00a0MiB\x02%.2[1]f\u00a0GiB\x02%.2[1]f\u00a0TiB" +
+ 	"\x02ਸਥਿਤੀ:\x02ਸਥਿਤੀ: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02ਵਾਇਰਗਾਰਡ: %[1]s"
+ 
+-var plIndex = []uint32{ // 180 elements
++var plIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000007, 0x00000014, 0x0000005c,
+ 	0x00000074, 0x0000008b, 0x000000d9, 0x00000117,
+@@ -3891,7 +3922,8 @@ var plIndex = []uint32{ // 180 elements
+ 	0x000018a0, 0x000018ad, 0x000018ba, 0x000018c7,
+ 	0x000018d4, 0x000018d4, 0x000018d4, 0x000018dc,
+ 	0x000018ea, 0x000018f7, 0x000018fc, 0x0000190d,
+-} // Size: 744 bytes
++	0x0000190d, 0x0000190d, 0x0000190d,
++} // Size: 756 bytes
+ 
+ const plData string = "" + // Size: 6413 bytes
+ 	"\x02Błąd\x04\x00\x01 \x08\x02Błąd:\x02(brak argumentu): Podnieś uprawnie" +
+@@ -3995,7 +4027,7 @@ const plData string = "" + // Size: 6413 bytes
+ 	"iB\x02%.2[1]f\u00a0MiB\x02%.2[1]f\u00a0GiB\x02%.2[1]f\u00a0TiB\x02Status" +
+ 	":\x02Status: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireGuard: %[1]s"
+ 
+-var pt_BRIndex = []uint32{ // 180 elements
++var pt_BRIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000005, 0x00000010, 0x0000004a,
+ 	0x0000005e, 0x0000007b, 0x000000cd, 0x0000010d,
+@@ -4047,9 +4079,10 @@ var pt_BRIndex = []uint32{ // 180 elements
+ 	0x00001694, 0x000016a0, 0x000016ac, 0x000016b8,
+ 	0x000016c4, 0x000016c4, 0x000016c4, 0x000016cc,
+ 	0x000016da, 0x000016e7, 0x000016ec, 0x000016fd,
+-} // Size: 744 bytes
++	0x00001734, 0x0000174b, 0x000017df,
++} // Size: 756 bytes
+ 
+-const pt_BRData string = "" + // Size: 5885 bytes
++const pt_BRData string = "" + // Size: 6111 bytes
+ 	"\x02Erro\x04\x00\x01 \x06\x02Erro:\x02(sem argumento): elevar e instalar" +
+ 	" o serviço gerenciador\x02Uso: %[1]s [\x0a%[2]s]\x02Opções de linha de c" +
+ 	"omando\x02Não foi possível determinar se o processo está sendo executado" +
+@@ -4140,9 +4173,12 @@ const pt_BRData string = "" + // Size: 5885 bytes
+ 	"tatus: aguardando o serviço do atualizador\x02Erro: %[1]v. Tente novamen" +
+ 	"te.\x02Status: concluído!\x02%[1]d B\x02%.2[1]f KiB\x02%.2[1]f MiB\x02%." +
+ 	"2[1]f GiB\x02%.2[1]f TiB\x02Status:\x02Status: %[1]s\x02%[1]s: %[2]q\x02" +
+-	"MTU:\x02WireGuard: %[1]s"
++	"MTU:\x02WireGuard: %[1]s\x02Configuração de inicialização do Windows inv" +
++	"álida\x02Iniciar com o &Windows\x02Quando esta conexão estiver ativa, r" +
++	"econectar automaticamente após reiniciar o Windows. Desativar a conexão " +
++	"impede que ela inicie com o Windows."
+ 
+-var pt_PTIndex = []uint32{ // 180 elements
++var pt_PTIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000005, 0x00000010, 0x00000045,
+ 	0x00000062, 0x00000080, 0x000000d2, 0x00000112,
+@@ -4194,9 +4230,10 @@ var pt_PTIndex = []uint32{ // 180 elements
+ 	0x00001724, 0x00001724, 0x00001724, 0x00001724,
+ 	0x00001724, 0x00001724, 0x00001724, 0x0000172c,
+ 	0x0000173a, 0x0000173a, 0x0000173a, 0x0000173a,
+-} // Size: 744 bytes
++	0x0000176a, 0x00001781, 0x00001820,
++} // Size: 756 bytes
+ 
+-const pt_PTData string = "" + // Size: 5946 bytes
++const pt_PTData string = "" + // Size: 6176 bytes
+ 	"\x02Erro\x04\x00\x01 \x06\x02Erro:\x02(sem argumento): elevar e instalar" +
+ 	" o serviço gestor\x02Utilização: %[1]s [\x0a%[2]s]\x02Opções da linha de" +
+ 	" comandos\x02Não foi possível determinar se o processo está a ser execut" +
+@@ -4287,9 +4324,13 @@ const pt_PTData string = "" + // Size: 5946 bytes
+ 	"o: a aguardar pelo utilizador\x02Actualizar agora\x02Solicite ao adminis" +
+ 	"trador do sistema para actualizar.\x02Estado: a aguardar pelo administra" +
+ 	"dor\x02Estado: a aguardar pelo serviço de actualização\x02Erro: %[1]v. T" +
+-	"ente novamente.\x02Estado: concluído!\x02Estado:\x02Estado: %[1]s"
++	"ente novamente.\x02Estado: concluído!\x02Estado:\x02Estado: %[1]s\x02Con" +
++	"figuração de arranque do Windows inválida\x02Iniciar com o &Windows\x02Q" +
++	"uando este túnel estiver ativo, restabelecer automaticamente a ligação a" +
++	"pós reiniciar o Windows. Desativar o túnel impede que este inicie com o " +
++	"Windows."
+ 
+-var roIndex = []uint32{ // 180 elements
++var roIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000007, 0x00000014, 0x0000006a,
+ 	0x00000084, 0x0000009f, 0x000000de, 0x00000127,
+@@ -4341,7 +4382,8 @@ var roIndex = []uint32{ // 180 elements
+ 	0x00001882, 0x0000188f, 0x0000189c, 0x000018a9,
+ 	0x000018b6, 0x000018b6, 0x000018b6, 0x000018bd,
+ 	0x000018ca, 0x000018d7, 0x000018dc, 0x000018ed,
+-} // Size: 744 bytes
++	0x000018ed, 0x000018ed, 0x000018ed,
++} // Size: 756 bytes
+ 
+ const roData string = "" + // Size: 6381 bytes
+ 	"\x02Eroare\x04\x00\x01 \x08\x02Eroare:\x02(fără argument): obținere drep" +
+@@ -4445,7 +4487,7 @@ const roData string = "" + // Size: 6381 bytes
+ 	".2[1]f\u00a0TiB\x02Stare:\x02Stare: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02Wir" +
+ 	"eGuard: %[1]s"
+ 
+-var ruIndex = []uint32{ // 180 elements
++var ruIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x0000000d, 0x00000020, 0x000000bc,
+ 	0x000000e7, 0x0000011a, 0x0000017d, 0x000001fd,
+@@ -4497,7 +4539,8 @@ var ruIndex = []uint32{ // 180 elements
+ 	0x00002661, 0x00002670, 0x0000267f, 0x0000268e,
+ 	0x0000269d, 0x0000269d, 0x0000269d, 0x000026ab,
+ 	0x000026bf, 0x000026cc, 0x000026d1, 0x000026e2,
+-} // Size: 744 bytes
++	0x000026e2, 0x000026e2, 0x000026e2,
++} // Size: 756 bytes
+ 
+ const ruData string = "" + // Size: 9954 bytes
+ 	"\x02Ошибка\x04\x00\x01 \x0e\x02Ошибка:\x02(нет аргумента): получить прав" +
+@@ -4598,7 +4641,7 @@ const ruData string = "" + // Size: 9954 bytes
+ 	"2[1]f КиБ\x02%.2[1]f МиБ\x02%.2[1]f ГиБ\x02%.2[1]f ТиБ\x02Статус:\x02Ста" +
+ 	"тус: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireGuard: %[1]s"
+ 
+-var si_LKIndex = []uint32{ // 180 elements
++var si_LKIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000013, 0x00000026, 0x000000bc,
+ 	0x000000df, 0x0000010f, 0x000001aa, 0x00000236,
+@@ -4650,7 +4693,8 @@ var si_LKIndex = []uint32{ // 180 elements
+ 	0x00002ee5, 0x00002ef9, 0x00002f0d, 0x00002f21,
+ 	0x00002f35, 0x00002f35, 0x00002f35, 0x00002f49,
+ 	0x00002f63, 0x00002f70, 0x00002f75, 0x00002f75,
+-} // Size: 744 bytes
++	0x00002f75, 0x00002f75, 0x00002f75,
++} // Size: 756 bytes
+ 
+ const si_LKData string = "" + // Size: 12149 bytes
+ 	"\x02දෝෂයකි\x04\x00\x01 \x0e\x02දෝෂය:\x02(තර්කයක් නැත): කළමනාකරු සේවාව ඉහ" +
+@@ -4743,7 +4787,7 @@ const si_LKData string = "" + // Size: 12149 bytes
+ 	".බ. %.2[1]f\x02තත්\u200dවය:\x02තත්\u200dවය: %[1]s\x02%[1]s: %[2]q\x02MTU" +
+ 	":"
+ 
+-var skIndex = []uint32{ // 180 elements
++var skIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000006, 0x00000012, 0x0000006a,
+ 	0x00000084, 0x000000a3, 0x000000dd, 0x0000012a,
+@@ -4795,7 +4839,8 @@ var skIndex = []uint32{ // 180 elements
+ 	0x000018d1, 0x000018de, 0x000018eb, 0x000018f8,
+ 	0x00001905, 0x00001905, 0x00001907, 0x0000190d,
+ 	0x00001919, 0x00001926, 0x0000192b, 0x0000193c,
+-} // Size: 744 bytes
++	0x0000193c, 0x0000193c, 0x0000193c,
++} // Size: 756 bytes
+ 
+ const skData string = "" + // Size: 6460 bytes
+ 	"\x02Chyba\x04\x00\x01 \x07\x02Chyba:\x02(bez argumentu): získať administ" +
+@@ -4897,7 +4942,7 @@ const skData string = "" + // Size: 6460 bytes
+ 	"\u00a0MiB\x02%.2[1]f\u00a0GiB\x02%.2[1]f\u00a0TiB\x02 \x02Stav:\x02Stav:" +
+ 	" %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireGuard: %[1]s"
+ 
+-var slIndex = []uint32{ // 180 elements
++var slIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000007, 0x00000014, 0x00000065,
+ 	0x0000007d, 0x00000096, 0x000000ce, 0x00000114,
+@@ -4949,7 +4994,8 @@ var slIndex = []uint32{ // 180 elements
+ 	0x00001704, 0x00001711, 0x0000171e, 0x0000172b,
+ 	0x00001738, 0x00001738, 0x0000173a, 0x00001742,
+ 	0x00001750, 0x0000175d, 0x00001762, 0x00001773,
+-} // Size: 744 bytes
++	0x00001773, 0x00001773, 0x00001773,
++} // Size: 756 bytes
+ 
+ const slData string = "" + // Size: 6003 bytes
+ 	"\x02Napaka\x04\x00\x01 \x08\x02Napaka:\x02(brez argumenta): povzdigni na" +
+@@ -5050,7 +5096,7 @@ const slData string = "" + // Size: 6003 bytes
+ 	"KiB\x02%.2[1]f\u00a0MiB\x02%.2[1]f\u00a0GiB\x02%.2[1]f\u00a0TiB\x02 \x02" +
+ 	"Status:\x02Status: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireGuard: %[1]s"
+ 
+-var srIndex = []uint32{ // 180 elements
++var srIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x0000000d, 0x00000020, 0x0000009d,
+ 	0x000000be, 0x000000e9, 0x00000144, 0x000001af,
+@@ -5102,7 +5148,8 @@ var srIndex = []uint32{ // 180 elements
+ 	0x0000242a, 0x0000242a, 0x0000242a, 0x0000242a,
+ 	0x0000242a, 0x0000242a, 0x0000242a, 0x00002438,
+ 	0x0000244c, 0x0000244c, 0x0000244c, 0x0000244c,
+-} // Size: 744 bytes
++	0x0000244c, 0x0000244c, 0x0000244c,
++} // Size: 756 bytes
+ 
+ const srData string = "" + // Size: 9292 bytes
+ 	"\x02Грешка\x04\x00\x01 \x0e\x02Грешка:\x02(без аргумента): повишава прив" +
+@@ -5196,7 +5243,7 @@ const srData string = "" + // Size: 9292 bytes
+ 	"атор\x02Статус: Чека се сервис за ажурирање\x02Грешка: %[1]v. Покушајте" +
+ 	" поново.\x02Статус: Завршено!\x02Статус:\x02Статус: %[1]s"
+ 
+-var sv_SEIndex = []uint32{ // 180 elements
++var sv_SEIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000004, 0x0000000e, 0x00000046,
+ 	0x00000062, 0x00000079, 0x000000b9, 0x00000109,
+@@ -5248,7 +5295,8 @@ var sv_SEIndex = []uint32{ // 180 elements
+ 	0x000014e6, 0x000014f3, 0x00001500, 0x0000150d,
+ 	0x0000151a, 0x0000151a, 0x0000151a, 0x00001522,
+ 	0x00001530, 0x0000153d, 0x00001542, 0x00001553,
+-} // Size: 744 bytes
++	0x00001553, 0x00001553, 0x00001553,
++} // Size: 756 bytes
+ 
+ const sv_SEData string = "" + // Size: 5459 bytes
+ 	"\x02Fel\x04\x00\x01 \x05\x02Fel:\x02(inget argument): höj och installera" +
+@@ -5338,7 +5386,7 @@ const sv_SEData string = "" + // Size: 5459 bytes
+ 	"\x02%.2[1]f\u00a0MiB\x02%.2[1]f\u00a0GiB\x02%.2[1]f\u00a0TiB\x02Status:" +
+ 	"\x02Status: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireGuard: %[1]s"
+ 
+-var trIndex = []uint32{ // 180 elements
++var trIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000005, 0x00000010, 0x0000005e,
+ 	0x00000078, 0x00000094, 0x000000d8, 0x0000011d,
+@@ -5390,7 +5438,8 @@ var trIndex = []uint32{ // 180 elements
+ 	0x000015b7, 0x000015c4, 0x000015d1, 0x000015de,
+ 	0x000015eb, 0x000015eb, 0x000015eb, 0x000015f2,
+ 	0x000015ff, 0x0000160c, 0x00001611, 0x00001622,
+-} // Size: 744 bytes
++	0x00001622, 0x00001622, 0x00001622,
++} // Size: 756 bytes
+ 
+ const trData string = "" + // Size: 5666 bytes
+ 	"\x02Hata\x04\x00\x01 \x06\x02Hata:\x02(parametre belirtilmediyse): gerek" +
+@@ -5479,7 +5528,7 @@ const trData string = "" + // Size: 5666 bytes
+ 	"1]f\u00a0KiB\x02%.2[1]f\u00a0MiB\x02%.2[1]f\u00a0GiB\x02%.2[1]f\u00a0TiB" +
+ 	"\x02Durum:\x02Durum: %[1]s\x02%[1]s: %[2]q\x02MTU:\x02WireGuard: %[1]s"
+ 
+-var ukIndex = []uint32{ // 180 elements
++var ukIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x0000000f, 0x00000024, 0x000000a3,
+ 	0x000000cc, 0x000000ff, 0x00000159, 0x000001d3,
+@@ -5531,7 +5580,8 @@ var ukIndex = []uint32{ // 180 elements
+ 	0x00002507, 0x00002514, 0x00002521, 0x0000252e,
+ 	0x0000253a, 0x0000253a, 0x0000253a, 0x00002548,
+ 	0x0000255c, 0x00002569, 0x0000256e, 0x0000257f,
+-} // Size: 744 bytes
++	0x0000257f, 0x0000257f, 0x0000257f,
++} // Size: 756 bytes
+ 
+ const ukData string = "" + // Size: 9599 bytes
+ 	"\x02Помилка\x04\x00\x01 \x10\x02Помилка:\x02(немає аргумента): отримати " +
+@@ -5630,7 +5680,7 @@ const ukData string = "" + // Size: 9599 bytes
+ 	"\x02%.2[1]f МБ\x02%.2[1]f ГБ\x02%.2[1]f TiB\x02Статус:\x02Статус: %[1]s" +
+ 	"\x02%[1]s: %[2]q\x02MTU:\x02WireGuard: %[1]s"
+ 
+-var viIndex = []uint32{ // 180 elements
++var viIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000006, 0x00000012, 0x0000005f,
+ 	0x0000007b, 0x00000094, 0x000000f2, 0x00000145,
+@@ -5682,7 +5732,8 @@ var viIndex = []uint32{ // 180 elements
+ 	0x0000171c, 0x00001728, 0x00001734, 0x00001740,
+ 	0x0000174c, 0x0000174c, 0x0000174c, 0x0000175b,
+ 	0x00001770, 0x00001770, 0x00001770, 0x00001770,
+-} // Size: 744 bytes
++	0x00001770, 0x00001770, 0x00001770,
++} // Size: 756 bytes
+ 
+ const viData string = "" + // Size: 6000 bytes
+ 	"\x02Lỗi\x04\x00\x01 \x07\x02Lỗi:\x02(không có tham số): nâng quyền và cà" +
+@@ -5763,7 +5814,7 @@ const viData string = "" + // Size: 6000 bytes
+ 	"ạng thái: Hoàn tất!\x02%[1]d B\x02%.2[1]f KiB\x02%.2[1]f MiB\x02%.2[1]" +
+ 	"f GiB\x02%.2[1]f TiB\x02Trạng thái:\x02Trạng thái: %[1]s"
+ 
+-var zh_CNIndex = []uint32{ // 180 elements
++var zh_CNIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000007, 0x00000014, 0x0000003d,
+ 	0x00000054, 0x00000064, 0x00000098, 0x000000d6,
+@@ -5815,7 +5866,8 @@ var zh_CNIndex = []uint32{ // 180 elements
+ 	0x000010d5, 0x000010e2, 0x000010ef, 0x000010fc,
+ 	0x00001109, 0x0000110d, 0x0000110f, 0x00001117,
+ 	0x00001125, 0x00001133, 0x00001138, 0x00001149,
+-} // Size: 744 bytes
++	0x00001149, 0x00001149, 0x00001149,
++} // Size: 756 bytes
+ 
+ const zh_CNData string = "" + // Size: 4425 bytes
+ 	"\x02错误\x04\x00\x01 \x08\x02错误:\x02(无参数): 提升并安装管理服务\x02用法: %[1]s [\x0a%[2" +
+@@ -5863,7 +5915,7 @@ const zh_CNData string = "" + // Size: 4425 bytes
+ 	"iB\x02%.2[1]f\u00a0MiB\x02%.2[1]f\u00a0GiB\x02%.2[1]f\u00a0TiB\x02、\x02 " +
+ 	"\x02状态:\x02状态: %[1]s\x02%[1]s：%[2]q\x02MTU:\x02WireGuard: %[1]s"
+ 
+-var zh_TWIndex = []uint32{ // 180 elements
++var zh_TWIndex = []uint32{ // 183 elements
+ 	// Entry 0 - 1F
+ 	0x00000000, 0x00000007, 0x00000016, 0x00000046,
+ 	0x00000065, 0x00000075, 0x000000b3, 0x000000ee,
+@@ -5915,7 +5967,8 @@ var zh_TWIndex = []uint32{ // 180 elements
+ 	0x000011e2, 0x000011ef, 0x000011fc, 0x00001209,
+ 	0x00001216, 0x0000121a, 0x0000121c, 0x00001223,
+ 	0x00001232, 0x00001241, 0x00001245, 0x00001257,
+-} // Size: 744 bytes
++	0x00001257, 0x00001257, 0x00001257,
++} // Size: 756 bytes
+ 
+ const zh_TWData string = "" + // Size: 4695 bytes
+ 	"\x02錯誤\x04\x00\x01 \x0a\x02錯誤：\x02(無參數)：提升權限並安裝管理服務\x02使用方法： %[1]s [\x0a" +
+@@ -5965,4 +6018,4 @@ const zh_TWData string = "" + // Size: 4695 bytes
+ 	"B\x02%.2[1]f\u00a0GiB\x02%.2[1]f\u00a0TiB\x02、\x02 \x02狀態\x02[狀態] %[1]s" +
+ 	"\x02%[1]s： %[2]q\x02MTU\x02WireGuard - %[1]s"
+ 
+-	// Total table size 303581 bytes (296KiB); checksum: 165105C0
++	// Total table size 304709 bytes (297KiB); checksum: BC6A4395
+
+base-commit: 6ece77bc487c8aa697e3c092197621c4f3e5ccb8
+-- 
+2.51.0.windows.1
+
